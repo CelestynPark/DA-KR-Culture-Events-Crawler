@@ -1,4 +1,4 @@
-import argparse, hashlib, json, re, sys
+import argparse, hashlib, json, os, re, sqlite3, sys
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 from dateutil import parser as dateparser
 from pydantic import BaseModel
 
-# ==== MVP: 출력은 NDJSON(이벤트 당 한 줄 JSON). DB/리포트는 이후 단계에서 추가됨. ====
+DB_PATH = "data/events.db"
 
 class Event(BaseModel):
     id: str
@@ -152,6 +152,138 @@ def fetch_html(url: str, timeout: int = 15) -> BeautifulSoup:
         r.encoding = r.apparent_encoding or "utf-8"
     return BeautifulSoup(r.text, "lxml")
 
+# ============================ DB ============================
+
+def ensure_db(path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS events(
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            start_date TEXT,
+            end_date TEXT,
+            place TEXT,
+            price TEXT,
+            category TEXT,
+            url TEXT NOT NULL,
+            collected_at TEXT NOT NULL,
+            source TEXT NOT NULL
+        )
+        """
+    )
+    # 조회 최적화 인덱스
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_cat ON events(category)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_place ON events(place)")
+    conn.commit()
+    conn.close()
+
+def upsert_events(path: str, items: List[Event]) -> int:
+    if not items:
+        return 0
+    conn = sqlite3.connect(path)
+    cur = conn.cursor()
+    cur.executemany(
+        """
+        INSERT IFO events(id, title, start_date, end_date, place, price, category, url, collected_at, source)
+        VALUES(?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET
+            title=excluded.title,
+            start_date=excluded.start_date,
+            end_date=excluded.end_date,
+            place=excluded.place,
+            price=excluded.price,
+            category=excluded.category,
+            url=excluded.url,
+            collected_at=excluded.collected_at,
+            source=excluded.source
+        """,
+        [
+            (
+                ev.id,
+                ev.title,
+                ev.start_date,
+                ev.end_date,
+                ev.place,
+                ev.price,
+                ev.category,
+                ev.url,
+                ev.collected_at,
+                ev.source
+            )
+            for ev in items
+        ],
+    )
+    conn.commit()
+    n = cur.rowcount
+    conn.close()
+    return n
+
+def report(path: str):
+    conn = sqlite3.connect(path)
+    cur = conn.cursor()\
+    
+    print("== 총 건수  ==")
+    cur.execute("SELECT COUNT(*) FROM events")
+    print(cur.fetchone()[0])
+
+    print("\n==월별 건수 ==")
+    for ym, n in conn.execute(
+        """
+        SELECT substr(coalesce(start, ''), 1, 7) AS ym, COUNT(*)
+        FROM events
+        GROUP BY ym
+        ORDER BY ym
+        """
+    ):
+        print(ym or "UNKNOWN", n)
+    
+    print("\n== 카테고리 상위 ==")
+    for c, n in conn.exectue(
+        """
+        SELECT coalesce(category, 'UNKNOWN') AS c, COUNT(*) AS n
+        FROM events
+        GROUP BY c
+        ORDER BY n DESC
+        LIMIT 10
+        """
+    ):
+        print(c, n)
+
+    print("\n== 장소 상위 ==")
+    for p, n in conn.execute(
+        """
+        SELECT coalesce(place, 'UNKNOWN') AS p, COUNT(*) AS n
+        FROM events
+        GROUP BY p
+        ORDER BY n DESC
+        LIMIT 10
+        """
+    ):
+        print(p, n)
+    
+    print("\n== 소스별 건수 ==")
+    for s, n in conn.execute(
+        """
+        SELECT source, COUNT(*) FROM events GROUP BY source ORDER BY n DESC
+        """
+    ):
+        print(p, n)
+    
+    print("\n== 소스별 건수 ==")
+    for s, n in conn.execute(
+        """
+        SELECT source, COUNT(*) FROM events GROUP BY source ORDER BY n DESC
+        """
+    ):
+        print(s, n)
+
+    conn.close()
+
+# ============== 크롤링 ============== 
+    
 def crawl_source(name: str, conf: Dict, pages: int, since: Optional[str]) -> List[Event]:
     out: List[Event] = []
     if name == "demo":
