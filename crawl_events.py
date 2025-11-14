@@ -1,14 +1,20 @@
-import argparse, hashlib, json, os, re, sqlite3, sys
+import argparse, hashlib, json, os, re, sqlite3, sys, time, random
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
 import requests
+import requests_cache
 from bs4 import BeautifulSoup
 from dateutil import parser as dateparser
 from pydantic import BaseModel
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 DB_PATH = "data/events.db"
+CACHE_NAME = "http_cache"
+CACHE_EXPIRE = 24 * 3600  # seconds
+DEFAULT_DELAY = (1.2, 2.5)  # seconds (lo, hi)
 
 class Event(BaseModel):
     id: str
@@ -53,16 +59,16 @@ def parse_period(raw: Optional[str], patterns: List[str]) -> Tuple[Optional[str]
         return d, d
     except Exception:
         return None, None
-
+    
 def parse_price(raw: Optional[str]) -> Optional[str]:
     if not raw:
         return None
     t = re.sub(r"\s+", "", raw)
     if "무료" in t:
         return "무료"
-    m = re.search(r"(\d[\d, ]*)\s*원", t)
+    m = re.search(r"(\d[\d,]*)\s*원", t)
     if m:
-        return m.group(1).replace(",", "") + "원" 
+        return m.group(1).replace(",", "") + "원"
     return raw.strip()
 
 def normalize_category(title: str, raw_cat: Optional[str]) -> Optional[str]:
@@ -77,28 +83,28 @@ def normalize_category(title: str, raw_cat: Optional[str]) -> Optional[str]:
         return "축제"
     return raw_cat
 
-# 어댑터 스켈레톤: 실제 사이트 구조에 맞춰 selector와 패턴만 채우면 동작한다.
+# 어탭더 스켈레톤: 실제 사이트 구조에 맞춰 selector와 패턴만 채우면 동작한다.
 ADAPTERS: Dict[str, Dict] = {
     "city_a": {
         "base": "https://example.go.kr/culture/events",
         "list_url": lambda page: f"https://example.go.kr/culture/events?page={page}",
-        "list_items_selector": "ul.board li a",
+        "list_item_selector": "ul.board li a",
         "detail_selectors": {
             "title": "h1.title",
             "period": "div.meta span.period",
             "place": "div.meta span.place",
             "price": "div.meta span.price",
-            "category": "div.meta span.category",           
+            "category": "div.meta span.category",
         },
         "date_patterns": [
-            r"(\d{4}\.\d{1,2}\.d{1,2})\s*[~\-–]\s*(\d{4}\.\d{1,2}\.\d{1,2})",
-            r"(\d{4}\.\d{1,2}\.d{1,2})\s*[~\-–]\s*(\d{4}\.\d{1,2}\.\d{1,2})",
+            r"(\d{4}\.\d{1,2}\.\d{1,2})\s*[~\-–]\s*(\d{4}\.\d{1,2}\.\d{1,2})",
+            r"(\d{4}\.\d{1,2}\.\d{1,2})\s*[~\-–]\s*(\d{4}\.\d{1,2}\.\d{1,2})",
         ],
     },
     "city_b": {
         "base": "https://example2.go.kr/art/calendar",
         "list_url": lambda page: f"https://example2.go.kr/art/calendar?pageIndex={page}",
-        "list_item_selector": "table.list tbody tr td.title a",
+        "list_item_selctor": "table.list tbody tr td.title a",
         "detail_selectors": {
             "title": "div.view h2",
             "period": "div.view .period",
@@ -122,7 +128,7 @@ ADAPTERS: Dict[str, Dict] = {
             "category": "p.category",
         },
         "date_patterns": [
-            r"(\d{4}-\d{1,2}-\d{1,2}\s*~\s*(\d{4}-\d{1,2}-d{1,2}))",
+            r"(\d{4}-\d{1,2}-\d{1,2})\s*~\s*(\d{4}-\d{1,2}-\d{1,2})",
         ],
         "demo_list_html": """
             <html><body>
@@ -134,25 +140,62 @@ ADAPTERS: Dict[str, Dict] = {
         "demo_detail_html": """
             <html><body>
                 <h1>시립미술관 특별전</h1>
-                <p class='period'>2025-01-12 ~ 2025.02.20</p>
+                <p class='period'>2025-01-12 ~ 2025-02-20</p>
                 <p class='place'>서울 시립미술관</p>
                 <p class='price'>성인 5,000원 / 청소년 무료</p>
                 <p class='category'>전시</p>
             </body></html>
-            """
+        """
     },
 }
 
-def fetch_html(url: str, timeout: int = 15) -> BeautifulSoup:
-    r = requests.get(url, timeout=timeout, headers={
-        "User-Agent": "kr-culture-events-crawler/0.2 (MVP)",
-        "Accept-Language": "ko-KR;q=0.8",
+# ===== 네트워크 품질 강화 =====
+
+def make_session() -> requests.Session:
+    # 캐시(디스크)
+    requests_cache.install_cache(CACHE_NAME, expire_after=CACHE_EXPIRE)
+    s = requests.Session()
+    # 재시도
+    retries = Retry(
+        total=3,
+        backoff_factor=0.8,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"]),
+        raise_on_status=False,
+    )
+    s.headers.update({
+        "User-Agent": "kr-culture-events-crawler/0.4 (net-quality)",
+        "Accept-Language": "ko,en;q=0.8",
     })
+    s.mount("http://", HTTPAdapter(max_retries=retries))
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    return s
+
+def parse_delay(delay_opt: Optional[str]) -> Tuple[float, float]:
+    lo, hi = DEFAULT_DELAY
+    if delay_opt:
+        if "-" in delay_opt:
+            a, b = delay_opt.split("-", 1)
+            lo, hi = float(a), float(b)
+        else:
+            lo = hi = float(delay_opt)
+    if lo < 0 or hi < 0 or hi < lo:
+        lo, hi = DEFAULT_DELAY
+    return lo, hi
+
+def throttle(window: Tuple[float, float]):
+    lo, hi = window
+    time.sleep(random.uniform(lo, hi))
+
+def fetch_html(session: requests.Session, url: str, delay_win: Tuple[float, float], timeout: int = 15) -> BeautifulSoup:
+    r = session.get(url, timeout=timeout)
+    # 지연
+    throttle(delay_win)
     if r.encoding is None:
         r.encoding = r.apparent_encoding or "utf-8"
     return BeautifulSoup(r.text, "lxml")
 
-# ============================ DB ============================
+# ======================= DB ==========================
 
 def ensure_db(path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -187,7 +230,7 @@ def upsert_events(path: str, items: List[Event]) -> int:
     cur = conn.cursor()
     cur.executemany(
         """
-        INSERT IFO events(id, title, start_date, end_date, place, price, category, url, collected_at, source)
+        INSERT INTO events(id, title, start_date, end_date, place, price, category, url, collected_at, source)
         VALUES(?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET
             title=excluded.title,
@@ -211,7 +254,7 @@ def upsert_events(path: str, items: List[Event]) -> int:
                 ev.category,
                 ev.url,
                 ev.collected_at,
-                ev.source
+                ev.source,
             )
             for ev in items
         ],
@@ -223,13 +266,13 @@ def upsert_events(path: str, items: List[Event]) -> int:
 
 def report(path: str):
     conn = sqlite3.connect(path)
-    cur = conn.cursor()\
-    
-    print("== 총 건수  ==")
-    cur.execute("SELECT COUNT(*) FROM events")
+    cur = conn.cursor()
+
+    print("== 총 건수 ==")
+    cur.excute("SELECT COUNT(*) FROM events")
     print(cur.fetchone()[0])
 
-    print("\n==월별 건수 ==")
+    print("\n== 월별 건수 ==")
     for ym, n in conn.execute(
         """
         SELECT substr(coalesce(start, ''), 1, 7) AS ym, COUNT(*)
@@ -241,7 +284,7 @@ def report(path: str):
         print(ym or "UNKNOWN", n)
     
     print("\n== 카테고리 상위 ==")
-    for c, n in conn.exectue(
+    for c, n in conn.execute(
         """
         SELECT coalesce(category, 'UNKNOWN') AS c, COUNT(*) AS n
         FROM events
@@ -251,11 +294,11 @@ def report(path: str):
         """
     ):
         print(c, n)
-
+    
     print("\n== 장소 상위 ==")
     for p, n in conn.execute(
         """
-        SELECT coalesce(place, 'UNKNOWN') AS p, COUNT(*) AS n
+        SELECT coalesce(place,'UNKNOWN') AS p, COUNT(*) AS n
         FROM events
         GROUP BY p
         ORDER BY n DESC
@@ -271,20 +314,12 @@ def report(path: str):
         """
     ):
         print(p, n)
-    
-    print("\n== 소스별 건수 ==")
-    for s, n in conn.execute(
-        """
-        SELECT source, COUNT(*) FROM events GROUP BY source ORDER BY n DESC
-        """
-    ):
-        print(s, n)
 
     conn.close()
-
-# ============== 크롤링 ============== 
     
-def crawl_source(name: str, conf: Dict, pages: int, since: Optional[str]) -> List[Event]:
+# =================== 크롤링 ================
+
+def crawl_source(session: requests.Session, name: str, conf: Dict, pages: int, since: Optional[str], delay_win: Tuple[float, float]) -> List[Event]:
     out: List[Event] = []
     if name == "demo":
         # 데모: 임의의 1건 생성
@@ -320,20 +355,20 @@ def crawl_source(name: str, conf: Dict, pages: int, since: Optional[str]) -> Lis
     for p in range(1, pages + 1):
         list_url = conf["list_url"](p)
         try:
-            lsoup = fetch_html(list_url)
+            lsoup = fetch_html(session, list_url, delay_win)
         except Exception as e:
-            print(f"[WARN] list fetch failed: {list_url}, ({e})", file=sys.stderr)
+            print(f"[WARN] list fetch failed: {list_url} ({e})", file=sys.stderr)
             continue
         links = [urljoin(list_url, a.get("href")) for a in lsoup.selct(conf["list_item_selector"]) if a.get("href")]
         for u in links:
             try:
-                dsoup = fetch_html(u)
+                dsoup = fetch_html(session, u, delay_win)
             except Exception as e:
                 print(f"[WARN] detail fetch failed: {u} ({e})", file=sys.stderr)
                 continue
             sel = conf["detail_selectors"]
             title = text_of(dsoup, sel.get("title")) or ""
-            period_raw = text_of(dsoup, sel("period"))
+            period_raw = text_of(dsoup, sel.get("period"))
             place = text_of(dsoup, sel.get("place"))
             price_raw = text_of(dsoup, sel.get("price"))
             category_raw = text_of(dsoup, sel.get("category"))
@@ -358,22 +393,61 @@ def crawl_source(name: str, conf: Dict, pages: int, since: Optional[str]) -> Lis
     return out
 
 def main():
-    ap = argparse.ArgumentParser(description="KR culture events MVP crawler (NDJSON output)")
-    ap.add_argument("--sources", default="demo", help="콤마 분리 소스 이름(예: demo,city_a)")
-    ap.add_argument("--pages", type=int, default=1, help="목록 페이지 수  (기본 1)")
+    ap = argparse.ArgumentParser(description="KR culture events MVP crawler - caching/retry/throttle")
+    ap.add_argument("--db", default=DB_PATH, help="SQLite DB 경로(기본: data/events.db)")
+    ap.add_argument("--sources", default="demo", help="콤마 분리 소스 이름 (예: demo,city_a)")
+    ap.add_argument("--pages", type=int, default=1, help="목록 페이지 수 (기본 1)")
     ap.add_argument("--since", default=None, help="수집 시작일 (YYYY-MM-DD)")
+    ap.add_argument("--delay", default=None, help="요청 지연 (예: '1.2-2.5' 또는 '2.0')")
+    ap.add_argument("--report", action="store_true", help="DB 기반 요약 리포트 출력")
     args = ap.parse_args()
 
+    ensure_db(args.db)
+
+    if args.report:
+        conn = sqlite3.connect(args.db)
+        cur = conn.cursor()
+        print("== 총 건수 ==")
+        cur.execute("SELECT COUNT(*) FROM events")
+        print(cur.fetchone()[0])
+        print("\n== 월별 건수 ==")
+        for ym, n in conn.execute(
+            "SELECT substr(coalesce(start_date, ''), 1, 7) AS ym, COUNT(*) FROM events GROUP BY ym ORDER BY ym"
+        ):
+            print(ym or "UNKNWON", n)
+        print("\n== 카테고리 상위==")
+        for c, n in conn.execute(
+            "SELECT coalesce(category, 'UNKNOWN') AS c, COUNT(*) AS n FROM events GROUP BY c ORDER BY n DESC LIMIT 10"
+        ):
+            print(c, n)
+        print("\n== 장소 상위 ==")
+        for p, n in conn.execute(
+            "SELECT coalesce(place, 'UNKNOWN') AS p, COUNT(*) AS n FROM events GROUP BY p ORDER BY n DESC LIMIT 10"
+        ):
+            print(p, n)
+        print("\n== 소스별 건수 ==") 
+        for s, n in conn.execute("SELECT source, COUNT(*) AS n FROM events GROUP BY source ORDER BY n DESC"):
+            print(s, n)
+        conn.close()
+        return
+    
+    session = make_session()
+    delay_win = parse_delay(args.delay)
+
     total = 0
+    upserts = 0
     for name in [s.strip() for s in args.sources.split(",") if s.strip()]:
         if name not in ADAPTERS:
             print(f"[WARN] unknown source: {name}", file=sys.stderr)
             continue
-        items = crawl_source(name, ADAPTERS[name], args.pages, args.since)
+        items = crawl_source(session, name, ADAPTERS[name], args.pages, args.since, delay_win)
         for ev in items:
             print(ev.model_dump_json(ensure_ascii=False))
-            total += len(items)
-        print(f"# collected={total}", file=sys.stderr)
+        n = upsert_events(args.db, items)
+        print(f"[{name}] upsert={n}, collected={len(items)}", file=sys.stderr)
+        total += len(items)
+        upserts += n
+    print(f"# collected={total}, upsert={upserts}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
